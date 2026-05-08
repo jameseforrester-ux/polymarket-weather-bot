@@ -6,6 +6,7 @@ from datetime import date
 import httpx
 from telegram import Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 from config import DATABASE_PATH, LOG_LEVEL, TELEGRAM_BOT_TOKEN, get_city
@@ -130,22 +131,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.answer()
     data = query.data
     if data == "home":
-        await query.edit_message_text(start_message(), parse_mode=ParseMode.HTML, reply_markup=main_menu())
+        await _safe_edit(query, start_message(), parse_mode=ParseMode.HTML, reply_markup=main_menu())
     elif data == "markets":
         markets = await context.application.bot_data["services"].active_markets(force=True)
-        await query.edit_message_text(markets_message(markets), parse_mode=ParseMode.HTML, reply_markup=market_menu(markets))
+        await _safe_edit(query, markets_message(markets), parse_mode=ParseMode.HTML, reply_markup=market_menu(markets))
     elif data in {"today", "tomorrow", "dayafter"}:
         offset = {"today": 0, "tomorrow": 1, "dayafter": 2}[data]
         results = await context.application.bot_data["services"].recommendations_all(offset)
         text = "\n\n".join(strategy_message(c, r) for c, r in results[:3]) or "No recommendations available."
-        await query.edit_message_text(text[:4000], parse_mode=ParseMode.HTML, reply_markup=main_menu())
+        await _safe_edit(query, text[:4000], parse_mode=ParseMode.HTML, reply_markup=main_menu())
     elif data == "edge":
         ranked = await context.application.bot_data["services"].best_edges()
         text = "\n".join(f"{rec.city}: {edge:+.0%}" for edge, _c, rec in ranked[:10]) or "No priced edges found yet."
-        await query.edit_message_text(text, reply_markup=main_menu())
+        await _safe_edit(query, text, reply_markup=main_menu())
     elif data == "settings":
         settings = await context.application.bot_data["db"].user_settings(query.message.chat_id)
-        await query.edit_message_text(settings_message(settings), parse_mode=ParseMode.HTML, reply_markup=main_menu())
+        await _safe_edit(query, settings_message(settings), parse_mode=ParseMode.HTML, reply_markup=main_menu())
+
+
+async def _safe_edit(query, text: str, **kwargs) -> None:
+    try:
+        await query.edit_message_text(text, **kwargs)
+    except BadRequest as exc:
+        if "message is not modified" in str(exc).lower():
+            return
+        raise
 
 
 async def _multi_recommendation(update: Update, context: ContextTypes.DEFAULT_TYPE, offset_days: int) -> None:

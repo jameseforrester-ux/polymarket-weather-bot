@@ -48,9 +48,10 @@ class HRRRClient:
                 continue
             try:
                 h = Herbie(run_time.strftime("%Y-%m-%d %H:00"), model="hrrr", product="sfc", fxx=fxx)
-                ds = h.xarray("TMP:2 m")
+                ds = h.xarray(r":TMP:2 m")
                 picked = ds.herbie.nearest_points(points=[(city.lon, city.lat)], names=[city.name])
-                kelvin = float(picked.t2m.values[0])
+                temp_var = "t2m" if "t2m" in picked.data_vars else next(iter(picked.data_vars))
+                kelvin = float(picked[temp_var].values[0])
                 temp_f = (kelvin - 273.15) * 9 / 5 + 32
                 hourly.append((valid.replace(tzinfo=None), temp_f))
                 max_f = temp_f if max_f is None else max(max_f, temp_f)
