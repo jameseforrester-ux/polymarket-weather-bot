@@ -1,0 +1,336 @@
+diff --git a/bot.py b/bot.py
+index e918719..9c7e1b6 100644
+--- a/bot.py
++++ b/bot.py
+@@ -6,6 +6,7 @@ from datetime import date
+ import httpx
+ from telegram import Update
+ from telegram.constants import ParseMode
++from telegram.error import BadRequest
+ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+ 
+ from config import DATABASE_PATH, LOG_LEVEL, TELEGRAM_BOT_TOKEN, get_city
+@@ -130,22 +131,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
+     await query.answer()
+     data = query.data
+     if data == "home":
+-        await query.edit_message_text(start_message(), parse_mode=ParseMode.HTML, reply_markup=main_menu())
++        await _safe_edit(query, start_message(), parse_mode=ParseMode.HTML, reply_markup=main_menu())
+     elif data == "markets":
+         markets = await context.application.bot_data["services"].active_markets(force=True)
+-        await query.edit_message_text(markets_message(markets), parse_mode=ParseMode.HTML, reply_markup=market_menu(markets))
++        await _safe_edit(query, markets_message(markets), parse_mode=ParseMode.HTML, reply_markup=market_menu(markets))
+     elif data in {"today", "tomorrow", "dayafter"}:
+         offset = {"today": 0, "tomorrow": 1, "dayafter": 2}[data]
+         results = await context.application.bot_data["services"].recommendations_all(offset)
+         text = "\n\n".join(strategy_message(c, r) for c, r in results[:3]) or "No recommendations available."
+-        await query.edit_message_text(text[:4000], parse_mode=ParseMode.HTML, reply_markup=main_menu())
++        await _safe_edit(query, text[:4000], parse_mode=ParseMode.HTML, reply_markup=main_menu())
+     elif data == "edge":
+         ranked = await context.application.bot_data["services"].best_edges()
+         text = "\n".join(f"{rec.city}: {edge:+.0%}" for edge, _c, rec in ranked[:10]) or "No priced edges found yet."
+-        await query.edit_message_text(text, reply_markup=main_menu())
++        await _safe_edit(query, text, reply_markup=main_menu())
+     elif data == "settings":
+         settings = await context.application.bot_data["db"].user_settings(query.message.chat_id)
+-        await query.edit_message_text(settings_message(settings), parse_mode=ParseMode.HTML, reply_markup=main_menu())
++        await _safe_edit(query, settings_message(settings), parse_mode=ParseMode.HTML, reply_markup=main_menu())
++
++
++async def _safe_edit(query, text: str, **kwargs) -> None:
++    try:
++        await query.edit_message_text(text, **kwargs)
++    except BadRequest as exc:
++        if "message is not modified" in str(exc).lower():
++            return
++        raise
+ 
+ 
+ async def _multi_recommendation(update: Update, context: ContextTypes.DEFAULT_TYPE, offset_days: int) -> None:
+diff --git a/data/hrrr.py b/data/hrrr.py
+index ccc74da..31c633e 100644
+--- a/data/hrrr.py
++++ b/data/hrrr.py
+@@ -48,9 +48,10 @@ class HRRRClient:
+                 continue
+             try:
+                 h = Herbie(run_time.strftime("%Y-%m-%d %H:00"), model="hrrr", product="sfc", fxx=fxx)
+-                ds = h.xarray("TMP:2 m")
++                ds = h.xarray(r":TMP:2 m")
+                 picked = ds.herbie.nearest_points(points=[(city.lon, city.lat)], names=[city.name])
+-                kelvin = float(picked.t2m.values[0])
++                temp_var = "t2m" if "t2m" in picked.data_vars else next(iter(picked.data_vars))
++                kelvin = float(picked[temp_var].values[0])
+                 temp_f = (kelvin - 273.15) * 9 / 5 + 32
+                 hourly.append((valid.replace(tzinfo=None), temp_f))
+                 max_f = temp_f if max_f is None else max(max_f, temp_f)
+diff --git a/data/polymarket.py b/data/polymarket.py
+index 11eb679..ce094d0 100644
+--- a/data/polymarket.py
++++ b/data/polymarket.py
+@@ -22,13 +22,16 @@ CLOB_BASE = "https://clob.polymarket.com"
+ HIGH_TEMP_PATTERNS = [
+     re.compile(r"\b(high|highest|maximum|max)\b.*\b(temp|temperature|degrees?)\b", re.I),
+     re.compile(r"\b(temp|temperature)\b.*\b(high|highest|maximum|max)\b", re.I),
++    re.compile(r"\bwhat\s+will\s+the\s+high\s+be\b", re.I),
++    re.compile(r"\bwill\s+the\s+highest\s+temperature\b", re.I),
++    re.compile(r"\bdaily\s+high\b", re.I),
+     re.compile(r"\breach(?:es)?\s+\d{2,3}\s*(?:°|degrees?)", re.I),
+ ]
+ BUCKET_PATTERNS = [
+-    re.compile(r"(?P<low>\d{2,3})\s*(?:-|to|–)\s*(?P<high>\d{2,3})\s*(?:°|degrees?|f)?", re.I),
++    re.compile(r"(?P<low>\d{1,3})\s*(?:-|to|–)\s*(?P<high>\d{1,3})\s*(?:°|degrees?|[fc])?", re.I),
+     re.compile(r"between\s+(?P<low>\d{2,3})\s+and\s+(?P<high>\d{2,3})", re.I),
+ ]
+-THRESHOLD_PATTERN = re.compile(r"(?:above|over|at least|reach(?:es)?)\s+(?P<threshold>\d{2,3})\s*(?:°|degrees?|f)?", re.I)
++THRESHOLD_PATTERN = re.compile(r"(?:above|over|at least|reach(?:es)?|be)\s+(?P<threshold>\d{1,3})\s*(?:°|degrees?|[fc])?", re.I)
+ 
+ 
+ class PolymarketClient:
+@@ -43,22 +46,146 @@ class PolymarketClient:
+             if cached is not None:
+                 return cached
+ 
+-        params = {
+-            "tag": "weather",
+-            "active": "true",
+-            "closed": "false",
+-            "limit": "500",
+-        }
+-        response = await self.http.get(f"{GAMMA_BASE}/markets", params=params, timeout=30)
+-        response.raise_for_status()
+-        payload = response.json()
+-        rows = payload if isinstance(payload, list) else payload.get("markets", payload.get("data", []))
+-
+-        markets = [m for m in (self._parse_market(row) for row in rows) if m is not None]
++        rows = await self._collect_market_candidates()
++        unique_rows = self._dedupe_rows(rows)
++        markets = [m for m in (self._parse_market(row) for row in unique_rows) if m is not None]
++        log.info(
++            "Polymarket discovery: raw=%s deduped=%s matched_high_temp=%s",
++            len(rows),
++            len(unique_rows),
++            len(markets),
++        )
+         await self.refresh_prices(markets)
+         self.cache.set(cache_key, markets)
+         return markets
+ 
++    async def _collect_market_candidates(self) -> list[dict[str, Any]]:
++        rows: list[dict[str, Any]] = []
++
++        weather_tag_ids = await self._weather_tag_ids()
++        log.info("Resolved Polymarket weather tag ids: %s", weather_tag_ids)
++        for tag_id in weather_tag_ids:
++            rows.extend(await self._markets_from_events({"tag_id": tag_id, "related_tags": "true"}))
++
++        for query in ("highest temperature", "high temperature", "temperature", "weather"):
++            rows.extend(await self._markets_from_public_search(query))
++
++        # Last-resort fallback: page through active markets because Gamma silently ignores
++        # unsupported parameters like tag=weather.
++        for offset in range(0, 1000, 100):
++            try:
++                payload = await self._get_json(
++                    f"{GAMMA_BASE}/markets",
++                    {"active": "true", "closed": "false", "limit": "100", "offset": str(offset)},
++                )
++                page = self._as_rows(payload)
++                if not page:
++                    break
++                rows.extend([row for row in page if self._has_weather_hint(row)])
++            except Exception as exc:
++                log.warning("Broad Gamma market fallback failed at offset %s: %s", offset, exc)
++                break
++        return rows
++
++    async def _weather_tag_ids(self) -> list[str]:
++        # Weather has historically been tag id 84 on Gamma. Keep discovery too,
++        # because tag ids are not guaranteed to remain stable.
++        tag_ids: list[str] = ["84"]
++        for offset in range(0, 1000, 100):
++            try:
++                payload = await self._get_json(f"{GAMMA_BASE}/tags", {"limit": "100", "offset": str(offset)})
++            except Exception as exc:
++                log.warning("Tag lookup failed: %s", exc)
++                break
++            tags = self._as_rows(payload)
++            if not tags:
++                break
++            for tag in tags:
++                label = str(tag.get("label") or "").lower()
++                slug = str(tag.get("slug") or "").lower()
++                if slug in {"weather", "daily-temperature", "highest-temperature"} or label in {"weather", "daily temperature", "highest temperature"}:
++                    tag_ids.append(str(tag.get("id")))
++        return list(dict.fromkeys(tag_ids))
++
++    async def _markets_from_events(self, extra_params: dict[str, Any]) -> list[dict[str, Any]]:
++        rows: list[dict[str, Any]] = []
++        for offset in range(0, 500, 100):
++            params = {"active": "true", "closed": "false", "limit": "100", "offset": str(offset), **extra_params}
++            try:
++                payload = await self._get_json(f"{GAMMA_BASE}/events", params)
++            except Exception as exc:
++                log.warning("Gamma events request failed: %s", exc)
++                break
++            events = self._as_rows(payload)
++            if not events:
++                break
++            for event in events:
++                rows.extend(self._flatten_event_markets(event))
++        return rows
++
++    async def _markets_from_public_search(self, query: str) -> list[dict[str, Any]]:
++        rows: list[dict[str, Any]] = []
++        for page in range(1, 4):
++            params = {
++                "q": query,
++                "limit_per_type": "50",
++                "page": str(page),
++                "events_status": "active",
++                "keep_closed_markets": "0",
++                "search_profiles": "false",
++            }
++            try:
++                payload = await self._get_json(f"{GAMMA_BASE}/public-search", params)
++            except Exception as exc:
++                log.warning("Gamma public-search failed for %s: %s", query, exc)
++                break
++            for event in payload.get("events", []) if isinstance(payload, dict) else []:
++                rows.extend(self._flatten_event_markets(event))
++            for market in payload.get("markets", []) if isinstance(payload, dict) else []:
++                rows.append(market)
++        return rows
++
++    def _flatten_event_markets(self, event: dict[str, Any]) -> list[dict[str, Any]]:
++        markets = event.get("markets") or []
++        flattened = []
++        for market in markets:
++            row = {**market}
++            row.setdefault("eventTitle", event.get("title"))
++            row.setdefault("eventSlug", event.get("slug"))
++            row.setdefault("eventDate", event.get("eventDate") or event.get("startTime") or event.get("endDate"))
++            row.setdefault("tags", event.get("tags"))
++            flattened.append(row)
++        return flattened
++
++    def _dedupe_rows(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
++        seen: set[str] = set()
++        unique: list[dict[str, Any]] = []
++        for row in rows:
++            key = str(row.get("conditionId") or row.get("id") or row.get("slug") or row.get("question"))
++            if key in seen:
++                continue
++            seen.add(key)
++            unique.append(row)
++        return unique
++
++    async def _get_json(self, url: str, params: dict[str, Any]) -> Any:
++        response = await self.http.get(url, params=params, timeout=30)
++        response.raise_for_status()
++        return response.json()
++
++    def _as_rows(self, payload: Any) -> list[dict[str, Any]]:
++        if isinstance(payload, list):
++            return payload
++        if isinstance(payload, dict):
++            for key in ("markets", "events", "data"):
++                if isinstance(payload.get(key), list):
++                    return payload[key]
++        return []
++
++    def _has_weather_hint(self, row: dict[str, Any]) -> bool:
++        haystack = self._market_text(row)
++        return "temperature" in haystack or "weather" in haystack or "daily high" in haystack
++
+     async def refresh_prices(self, markets: Iterable[WeatherMarket]) -> None:
+         token_ids = [
+             outcome.token_id
+@@ -104,14 +231,15 @@ class PolymarketClient:
+             return None, None
+ 
+     def _parse_market(self, row: dict[str, Any]) -> Optional[WeatherMarket]:
+-        question = str(row.get("question") or row.get("title") or "")
+-        if not question or not any(pattern.search(question) for pattern in HIGH_TEMP_PATTERNS):
++        question = str(row.get("question") or row.get("title") or row.get("eventTitle") or "")
++        text = self._market_text(row)
++        if not question or not any(pattern.search(text) for pattern in HIGH_TEMP_PATTERNS):
+             return None
+ 
+         city = self._extract_city(question, row)
+         target_date = self._extract_date(question, row)
+-        bucket_low, bucket_high = self._extract_bucket(question)
+-        threshold = self._extract_threshold(question)
++        bucket_low, bucket_high = self._extract_bucket(text)
++        threshold = self._extract_threshold(text)
+         outcomes = self._extract_outcomes(row)
+ 
+         market = WeatherMarket(
+@@ -131,21 +259,23 @@ class PolymarketClient:
+         return market
+ 
+     def _extract_city(self, question: str, row: dict[str, Any]) -> Optional[str]:
+-        haystack = " ".join(
+-            str(x or "")
+-            for x in [question, row.get("slug"), row.get("description"), row.get("eventSlug")]
+-        ).lower()
++        haystack = self._market_text(row)
++        match = re.search(r"(?:highest|high|max(?:imum)?)\s+temperature\s+in\s+(.+?)\s+(?:be|on)\b", haystack, re.I)
++        if match:
++            return match.group(1).strip().title()
+         for city in CITIES.values():
+-            if any(keyword in haystack for keyword in city.polymarket_keywords):
+-                return city.name
++            for keyword in city.polymarket_keywords:
++                if re.search(rf"(?<![a-z0-9]){re.escape(keyword)}(?![a-z0-9])", haystack):
++                    return city.name
+         return None
+ 
+     def _extract_date(self, question: str, row: dict[str, Any]) -> Optional[date]:
+-        for key in ("endDate", "end_date", "startDate", "start_date"):
++        for key in ("eventDate", "endDate", "end_date", "startDate", "start_date", "startTime"):
+             parsed = self._parse_datetime(row.get(key))
+             if parsed:
+                 return parsed.date()
+-        match = re.search(r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2}(?:,\s+\d{4})?", question, re.I)
++        haystack = self._market_text(row)
++        match = re.search(r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2}(?:,\s+\d{4})?", haystack, re.I)
+         if match:
+             try:
+                 return date_parser.parse(match.group(0), fuzzy=True).date()
+@@ -159,7 +289,9 @@ class PolymarketClient:
+             if match:
+                 low = float(match.group("low"))
+                 high = float(match.group("high"))
+-                if high > low:
++                # Avoid parsing dates in slugs such as may-8-2026 as temperature
++                # buckets. Highest-temp buckets are narrow in either F or C.
++                if high > low and high <= 150 and (high - low) <= 20:
+                     return low, high
+         return None, None
+ 
+@@ -169,6 +301,24 @@ class PolymarketClient:
+             return None
+         return float(match.group("threshold"))
+ 
++    def _market_text(self, row: dict[str, Any]) -> str:
++        tags = row.get("tags") or []
++        tag_text = " ".join(str(tag.get("label") or tag.get("slug") or "") for tag in tags if isinstance(tag, dict))
++        outcomes = " ".join(str(x) for x in self._loads(row.get("outcomes"), []))
++        return " ".join(
++            str(x or "")
++            for x in [
++                row.get("question"),
++                row.get("title"),
++                row.get("eventTitle"),
++                row.get("slug"),
++                row.get("eventSlug"),
++                row.get("description"),
++                tag_text,
++                outcomes,
++            ]
++        ).lower()
++
+     def _extract_outcomes(self, row: dict[str, Any]) -> list[MarketOutcome]:
+         outcomes_raw = self._loads(row.get("outcomes"), [])
+         prices_raw = self._loads(row.get("outcomePrices"), [])
