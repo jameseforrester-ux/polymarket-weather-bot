@@ -231,6 +231,8 @@ class PolymarketClient:
             return None, None
 
     def _parse_market(self, row: dict[str, Any]) -> Optional[WeatherMarket]:
+        if row.get("closed") is True or row.get("active") is False:
+            return None
         question = str(row.get("question") or row.get("title") or row.get("eventTitle") or "")
         text = self._market_text(row)
         if not question or not any(pattern.search(text) for pattern in HIGH_TEMP_PATTERNS):
@@ -238,8 +240,9 @@ class PolymarketClient:
 
         city = self._extract_city(question, row)
         target_date = self._extract_date(question, row)
-        bucket_low, bucket_high = self._extract_bucket(text)
-        threshold = self._extract_threshold(text)
+        if target_date and target_date < date.today():
+            return None
+        bucket_low, bucket_high, threshold, market_unit, market_label = self._extract_temperature_terms(text)
         outcomes = self._extract_outcomes(row)
 
         market = WeatherMarket(
@@ -252,6 +255,8 @@ class PolymarketClient:
             bucket_low_f=bucket_low,
             bucket_high_f=bucket_high,
             threshold_f=threshold,
+            market_unit=market_unit,
+            market_label=market_label,
             outcomes=outcomes,
             end_time=self._parse_datetime(row.get("endDate") or row.get("end_date") or row.get("endTime")),
             raw=row,
@@ -300,6 +305,49 @@ class PolymarketClient:
         if not match:
             return None
         return float(match.group("threshold"))
+
+    def _extract_temperature_terms(
+        self, text: str
+    ) -> tuple[Optional[float], Optional[float], Optional[float], str, Optional[str]]:
+        unit = "C" if re.search(r"\d{1,3}\s*(?:°\s*)?c\b", text) else "F"
+        converter = self._c_to_f if unit == "C" else float
+        unit_symbol = "°C" if unit == "C" else "°F"
+
+        exact = re.search(r"\bbe\s+(?P<temp>\d{1,3})\s*(?:°\s*)?[cf]\b(?!\s*(?:or\s+below|or\s+higher))", text, re.I)
+        if exact:
+            value = float(exact.group("temp"))
+            low = converter(value)
+            high = converter(value + 1) if unit == "C" else converter(value + 1)
+            return low, high, None, unit, f"{value:.0f}{unit_symbol}"
+
+        below = re.search(r"\bbe\s+(?P<temp>\d{1,3})\s*(?:°\s*)?[cf]\s+or\s+below", text, re.I)
+        if below:
+            value = float(below.group("temp"))
+            return None, converter(value), converter(value), unit, f"≤{value:.0f}{unit_symbol}"
+
+        above = re.search(r"\bbe\s+(?P<temp>\d{1,3})\s*(?:°\s*)?[cf]\s+or\s+higher", text, re.I)
+        if above:
+            value = float(above.group("temp"))
+            return converter(value), None, converter(value), unit, f"≥{value:.0f}{unit_symbol}"
+
+        low, high = self._extract_bucket(text)
+        threshold = self._extract_threshold(text)
+        if unit == "C":
+            if low is not None:
+                low = self._c_to_f(low)
+            if high is not None:
+                high = self._c_to_f(high)
+            if threshold is not None:
+                threshold = self._c_to_f(threshold)
+        label = None
+        if low is not None and high is not None:
+            label = f"{low:.0f}-{high:.0f}°F" if unit == "F" else "bucket °C"
+        elif threshold is not None:
+            label = f"≥{threshold:.0f}°F" if unit == "F" else "threshold °C"
+        return low, high, threshold, unit, label
+
+    def _c_to_f(self, value: float) -> float:
+        return value * 9 / 5 + 32
 
     def _market_text(self, row: dict[str, Any]) -> str:
         tags = row.get("tags") or []

@@ -3,6 +3,7 @@ from __future__ import annotations
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from models import WeatherMarket
+from formatters.messages import grouped_market_keys
 
 
 def main_menu() -> InlineKeyboardMarkup:
@@ -17,9 +18,10 @@ def main_menu() -> InlineKeyboardMarkup:
 
 def market_menu(markets: list[WeatherMarket], prefix: str = "market") -> InlineKeyboardMarkup:
     rows = []
-    for market in markets[:20]:
-        label = f"{market.city or 'Unknown'} {market.target_date or ''}".strip()
-        rows.append([InlineKeyboardButton(label[:60], callback_data=f"{prefix}:{market.market_id[:40]}")])
+    for idx, (_key, grouped) in enumerate(grouped_market_keys(markets)[:20]):
+        sample = grouped[0]
+        label = f"{sample.city or 'Unknown'} {sample.target_date or ''} ({len(grouped)} buckets)".strip()
+        rows.append([InlineKeyboardButton(label[:60], callback_data=f"{prefix}:group:{idx}")])
     rows.append([InlineKeyboardButton("Refresh", callback_data="markets"), InlineKeyboardButton("Back", callback_data="home")])
     return InlineKeyboardMarkup(rows)
 

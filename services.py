@@ -23,7 +23,7 @@ class WeatherBotServices:
         self.ecmwf = ECMWFClient(http)
         self.openweather = OpenWeatherClient(http)
         self.metar = MetarClient(http)
-        self.hrrr = HRRRClient()
+        self.hrrr = HRRRClient(http)
         self.engine = StrategyEngine(bucket_width_f)
 
     async def active_markets(self, force: bool = False) -> list[WeatherMarket]:

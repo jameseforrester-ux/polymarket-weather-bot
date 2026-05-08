@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import re
 from html import escape
+from collections import defaultdict
 
 from models import ConsensusResult, ForecastPoint, StrategyRecommendation, WeatherMarket
 from strategy.edge import classify_edge
@@ -31,15 +33,26 @@ def start_message() -> str:
 def markets_message(markets: list[WeatherMarket]) -> str:
     if not markets:
         return "No active high-temperature Polymarket markets were discovered."
-    lines = ["<b>ACTIVE HIGH TEMP MARKETS</b>", "━━━━━━━━━━━━━━━━━━━━━━━━"]
-    for market in markets[:30]:
-        price = _yes_price(market)
-        bucket = _market_bucket_text(market)
-        unsupported = "" if market.city else " ⚠️ unsupported city"
+    groups = grouped_market_keys(markets)
+    lines = [
+        "<b>ACTIVE HIGH TEMP MARKETS</b>",
+        f"Found {len(markets)} bucket markets across {len(groups)} city/date groups.",
+        "━━━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    for (_city, _date, _event), grouped in groups[:40]:
+        sample = grouped[0]
+        prices = [o.price for m in grouped for o in m.outcomes if o.label.lower() == "yes" and o.price is not None]
+        best = max(prices) if prices else None
+        labels = [_market_bucket_text(m) for m in grouped]
+        temp_range = _summarize_labels(labels)
+        price = f"{best:.0%}" if best is not None else "n/a"
+        unsupported = "" if sample.city else " ⚠️ unsupported"
         lines.append(
-            f"• <b>{escape(market.city or 'Unknown')}</b>{unsupported} | {escape(str(market.target_date or 'date?'))} | "
-            f"{escape(bucket)} | YES {price}"
+            f"• <b>{escape(sample.city or 'Unknown')}</b>{unsupported} | {escape(str(sample.target_date or 'date?'))} | "
+            f"{len(grouped)} buckets {escape(temp_range)} | best YES {price}"
         )
+    if len(groups) > 40:
+        lines.append(f"… plus {len(groups) - 40} more groups.")
     return "\n".join(lines)
 
 
@@ -133,11 +146,34 @@ def _yes_price(market: WeatherMarket) -> str:
 
 
 def _market_bucket_text(market: WeatherMarket) -> str:
+    if market.market_label:
+        return market.market_label
     if market.bucket_low_f is not None and market.bucket_high_f is not None:
         return f"{market.bucket_low_f:.0f}-{market.bucket_high_f:.0f}°F"
     if market.threshold_f is not None:
         return f">{market.threshold_f:.0f}°F"
     return "bucket?"
+
+
+def grouped_market_keys(markets: list[WeatherMarket]):
+    grouped = defaultdict(list)
+    for market in markets:
+        event_key = market.raw.get("eventSlug") or _base_slug(market.slug or "") or market.question
+        grouped[(market.city or "Unknown", str(market.target_date or "date?"), event_key)].append(market)
+    return sorted(grouped.items(), key=lambda item: (item[0][1], item[0][0]))
+
+
+def _base_slug(slug: str) -> str:
+    return re.sub(r"-(?:\d{1,3})(?:c|f|corbelow|forbelow|corhigher|forhigher)?$", "", slug)
+
+
+def _summarize_labels(labels: list[str]) -> str:
+    clean = [label for label in labels if label and label != "bucket?"]
+    if not clean:
+        return ""
+    if len(clean) <= 3:
+        return ", ".join(clean)
+    return f"{clean[0]} … {clean[-1]}"
 
 
 def _model_row(p: ForecastPoint) -> str:

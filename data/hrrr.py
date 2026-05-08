@@ -1,64 +1,68 @@
 from __future__ import annotations
 
-import asyncio
-import logging
-from datetime import date, datetime, timedelta, timezone
-from typing import Optional
+from datetime import date, datetime
+
+import httpx
 
 from config import CACHE_TTL_SECONDS, CityConfig
 from data.cache import TTLCache
 from models import ForecastPoint
 
 
-log = logging.getLogger(__name__)
-
-
 class HRRRClient:
-    def __init__(self, ttl_seconds: int = CACHE_TTL_SECONDS):
+    """HRRR-backed forecast via Open-Meteo's GFS/HRRR API.
+
+    This avoids noisy Herbie/GRIB downloads in the Telegram bot process while
+    still using hourly HRRR-updated guidance for CONUS day-of checks.
+    """
+
+    def __init__(self, http: httpx.AsyncClient, ttl_seconds: int = CACHE_TTL_SECONDS):
+        self.http = http
         self.cache = TTLCache(ttl_seconds)
 
     async def forecast(self, city: CityConfig, target_date: date) -> ForecastPoint:
-        key = f"hrrr:{city.name}:{target_date}"
+        key = f"hrrr_openmeteo:{city.name}:{target_date}"
         cached = self.cache.get(key)
         if cached:
             return cached
+
+        params = {
+            "latitude": city.lat,
+            "longitude": city.lon,
+            "timezone": city.timezone,
+            "temperature_unit": "fahrenheit",
+            "hourly": "temperature_2m",
+            "daily": "temperature_2m_max",
+            # Open-Meteo's GFS endpoint uses best_match to blend HRRR updates
+            # into CONUS hourly forecasts when HRRR is available.
+            "models": "best_match",
+            "start_date": target_date.isoformat(),
+            "end_date": target_date.isoformat(),
+        }
         try:
-            point = await asyncio.to_thread(self._forecast_sync, city, target_date)
+            response = await self.http.get("https://api.open-meteo.com/v1/gfs", params=params, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            high = self._first(data.get("daily", {}).get("temperature_2m_max"))
+            hourly = self._hourly(data)
+            if high is None and hourly:
+                high = max(temp for _, temp in hourly)
+            point = ForecastPoint(source="hrrr", high_f=high, hourly_f=hourly, confidence=0.80)
         except Exception as exc:
-            log.warning("HRRR forecast failed for %s: %s", city.name, exc)
-            point = ForecastPoint(source="hrrr", high_f=None, error=str(exc), confidence=0.0)
-        self.cache.set(key, point)
+            point = ForecastPoint(source="hrrr", high_f=None, error=f"HRRR unavailable via Open-Meteo: {exc}", confidence=0.0)
+        self.cache.set(key, point, ttl_seconds=900)
         return point
 
-    def _forecast_sync(self, city: CityConfig, target_date: date) -> ForecastPoint:
-        try:
-            from herbie import Herbie
-        except Exception as exc:
-            raise RuntimeError("Install optional HRRR dependencies: herbie-data, xarray, cfgrib") from exc
+    def _first(self, values):
+        return float(values[0]) if values else None
 
-        now_utc = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
-        run_time = now_utc - timedelta(hours=2)
-        run_time = run_time.replace(hour=run_time.hour)
-
-        hourly: list[tuple[datetime, float]] = []
-        max_f: Optional[float] = None
-        for fxx in range(0, 37):
-            valid = run_time + timedelta(hours=fxx)
-            if valid.date() != target_date:
-                continue
+    def _hourly(self, data: dict) -> list[tuple[datetime, float]]:
+        times = data.get("hourly", {}).get("time") or []
+        temps = data.get("hourly", {}).get("temperature_2m") or []
+        rows = []
+        for t, temp in zip(times, temps):
             try:
-                h = Herbie(run_time.strftime("%Y-%m-%d %H:00"), model="hrrr", product="sfc", fxx=fxx)
-                ds = h.xarray(r":TMP:2 m")
-                picked = ds.herbie.nearest_points(points=[(city.lon, city.lat)], names=[city.name])
-                temp_var = "t2m" if "t2m" in picked.data_vars else next(iter(picked.data_vars))
-                kelvin = float(picked[temp_var].values[0])
-                temp_f = (kelvin - 273.15) * 9 / 5 + 32
-                hourly.append((valid.replace(tzinfo=None), temp_f))
-                max_f = temp_f if max_f is None else max(max_f, temp_f)
-            except Exception as exc:
-                log.debug("Skipping HRRR f%02d for %s: %s", fxx, city.name, exc)
+                rows.append((datetime.fromisoformat(t), float(temp)))
+            except Exception:
                 continue
-
-        if max_f is None:
-            raise RuntimeError("No HRRR 2m temperature points available")
-        return ForecastPoint(source="hrrr", high_f=max_f, hourly_f=hourly, confidence=0.82)
+        return rows

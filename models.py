@@ -25,6 +25,8 @@ class WeatherMarket:
     bucket_low_f: Optional[float]
     bucket_high_f: Optional[float]
     threshold_f: Optional[float]
+    market_unit: str = "F"
+    market_label: Optional[str] = None
     outcomes: list[MarketOutcome] = field(default_factory=list)
     end_time: Optional[datetime] = None
     raw: dict[str, Any] = field(default_factory=dict)
